@@ -51,6 +51,7 @@ typedef struct {
 typedef struct {
     size_t return_pc;    // 呼び出し元に戻るためのPC
     int local_base;      // このフレームのローカル変数の開始インデックス
+    int32_t locals[16];  // このフレームのローカル変数のバックアップ
     int sp_base;         // このフレームのスタックポインタのベース
 } CallFrame;
 
@@ -188,7 +189,7 @@ printf("results=%d\n", ftype.result_count);
 
 void parse_import_section(WasmVM *vm, size_t *pc, size_t end_pc) {
     uint32_t import_count = read_uLEB128(vm->code, pc);
-printf("  import_count=%d\n", import_count);
+    printf("  import_count=%d\n", import_count);
     for (uint32_t i = 0; i < import_count; i++) {
         uint32_t mlen = read_uLEB128(vm->code, pc);
         char mod_name[256];
@@ -207,10 +208,10 @@ printf("  import_count=%d\n", import_count);
         *pc += flen;
 
         uint8_t kind = vm->code[(*pc)++];
-printf("  import[%d]: mod='%s', field='%s', kind=%d\n", i, mod_name, field_name, kind);
+        printf("  import[%d]: mod='%s', field='%s', kind=%d\n", i, mod_name, field_name, kind);
         if (kind == 0x00) { // function import
             uint32_t type_index = read_uLEB128(vm->code, pc);
-printf("    type_index=%d\n", type_index);
+            printf("    type_index=%d\n", type_index);
             if (vm->import_func_count < MAX_IMPORT_FUNCS) {
                 vm->import_funcs[vm->import_func_count++] = (ImportFunc){ add_string_to_buffer(vm, mod_name), add_string_to_buffer(vm, field_name), type_index, 0, NULL };
             }
@@ -395,52 +396,86 @@ ExportFunc *find_export(WasmVM *vm, const char *name) {
     return NULL;
 }
 
-// 構造解析関数
+#include <stdint.h>
+#include <stddef.h>
+
+// 簡易的に WebAssembly の命令のオペランド長を判定してスキップする関数
+size_t skip_operands(uint8_t op, uint8_t *code, size_t pc) {
+    switch (op) {
+        case 0x20: // local.get
+        case 0x21: // local.set
+        case 0x22: // local.tee
+        case 0x23: // global.get
+        case 0x24: // global.set
+        case 0x10: // call
+            (void)read_uLEB128(code, &pc);
+            break;
+        case 0x41: // i32.const
+        case 0x42: // i64.const
+            (void)read_sLEB128(code, &pc);
+            break;
+        case 0x28: case 0x29: case 0x2A: case 0x2B: // load
+        case 0x36: case 0x37: case 0x38: case 0x39: // store
+            (void)read_uLEB128(code, &pc); // align
+            (void)read_uLEB128(code, &pc); // offset
+            break;
+        default:
+            // その他の命令はオペランドなし
+            break;
+    }
+    return pc;
+}
+
+// start_pc の if/block/loop の対応する end_pc を返す
 size_t find_structured_end(uint8_t *code, size_t code_size, size_t start_pc, size_t *else_pc_out) {
     int depth = 1;
     size_t pc = start_pc;
     if (else_pc_out) *else_pc_out = 0;
 
-    while (depth > 0) {
-        if (pc >= code_size) return code_size;
-        
+    while (depth > 0 && pc < code_size) {
         uint8_t op = code[pc++];
         switch (op) {
-            case 0x02: case 0x03: case OP_IF:
+            case 0x02: // block
+            case 0x03: // loop
+            case 0x04: // if
                 depth++;
-                pc++; // blocktype をスキップ
+                pc++; // skip blocktype
                 break;
-            case OP_ELSE:
-                if (depth == 1 && else_pc_out) {
-                    *else_pc_out = pc;
-                }
+            case 0x05: // else
+                if (depth == 1 && else_pc_out) *else_pc_out = pc;
                 break;
-            case OP_END:
+            case 0x0B: // end
                 depth--;
+                if (depth == 0) return pc; // end_pc を返す
                 break;
-            case 0x0C: case 0x0D: case 0x20: case 0x21:
-                read_uLEB128(code, &pc);
-                break;
-            case 0x41:
-                read_sLEB128(code, &pc);
+            default:
+                pc = skip_operands(op, code, pc);
                 break;
         }
     }
     return pc;
 }
 
-// Wasmモジュール内の関数を実行する（ローカル変数宣言のパースを含む）
-void run_function(WasmVM *vm) {
-    uint32_t local_groups = read_uLEB128(vm->code, &vm->pc);
-    for (uint32_t i = 0; i < local_groups; i++) { /* uint32_t num_locals = */read_uLEB128(vm->code, &vm->pc); (void)vm->code[vm->pc++]; }
-
-    while (1) { // pc < vm->size のチェックは不要。returnで抜ける
-        uint8_t op = vm->code[vm->pc++];
+void run(WasmVM *vm) {
+    while (1) {
+        size_t current_pc = vm->pc; // 実行前のpcを保存
+        if (current_pc >= vm->size) {
+            printf("PC out of bounds\n");
+            return;
+        }
+        uint8_t op = vm->code[vm->pc++]; // 命令を読み込み、pcをインクリメント
+        printf("opcode: 0x%02X at pc=%zu; ", op, current_pc);
         switch (op) {
-            case 0x20: { uint32_t i = read_uLEB128(vm->code, &vm->pc); vm->stack[vm->sp++] = vm->locals[i]; break; }
+            case 0x20: {
+                uint32_t i = read_uLEB128(vm->code, &vm->pc);
+                vm->stack[vm->sp++] = vm->locals[i];
+                printf("[local.get] %d: %d\n", i, vm->locals[i]);
+                break;
+            }
             case 0x21: { uint32_t i = read_uLEB128(vm->code, &vm->pc); vm->locals[i] = vm->stack[--vm->sp]; break; }
             case 0x41: { // i32.const
                 int32_t val = read_sLEB128(vm->code, &vm->pc);
+                printf("[i32.const] %d\n", val);
                 vm->stack[vm->sp++] = val;
                 break;
             }
@@ -450,7 +485,13 @@ void run_function(WasmVM *vm) {
                 vm->stack[vm->sp++] = a + b;
                 break;
             }
-            case 0x6B: { int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = a - b; break; } // i32.sub
+            case 0x6B: {
+                int32_t b = vm->stack[--vm->sp];
+                int32_t a = vm->stack[--vm->sp];
+                printf("[i32.sub] a = %d, b = %d\n", a, b);
+                vm->stack[vm->sp++] = a - b;
+                break;
+            }
             case 0x6C: { int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = a * b; break; } // i32.mul
             case 0x6D: { int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; if (b == 0) { return; } if (a == INT32_MIN && b == -1) { return; } vm->stack[vm->sp++] = a / b; break; } // i32.div_s
             case 0x6E: { uint32_t b = vm->stack[--vm->sp]; uint32_t a = vm->stack[--vm->sp]; if (b == 0) { return; } vm->stack[vm->sp++] = (int32_t)(a / b); break; } // i32.div_u
@@ -460,7 +501,13 @@ void run_function(WasmVM *vm) {
             case 0x4A: { int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (a > b); break; }
             case 0x4B: { uint32_t b = vm->stack[--vm->sp]; uint32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (a > b); break; }
             case 0x4C: { int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (a <= b); break; }
-            case 0x4D: { uint32_t b = vm->stack[--vm->sp]; uint32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (a <= b); break; }
+            case 0x4D: {
+                uint32_t b = vm->stack[--vm->sp];
+                uint32_t a = vm->stack[--vm->sp];
+                printf("[i32.le_u] a = %d, b = %d\n", a, b);
+                vm->stack[vm->sp++] = (a <= b);
+                break;
+            }
             case 0x4E: { int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (a >= b); break; }
             case 0x4F: { uint32_t b = vm->stack[--vm->sp]; uint32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (a >= b); break; }
 
@@ -483,10 +530,11 @@ void run_function(WasmVM *vm) {
                 size_t then_start_pc = vm->pc;
                 size_t else_pc;
                 size_t end_pc = find_structured_end(vm->code, vm->size, vm->pc, &else_pc);
+                printf("[if] else_pc = %ld, end_pc = %ld; ", else_pc, end_pc);
                 int32_t cond = vm->stack[--vm->sp];
+                printf("cond = %d\n", cond);
                 
-                vm->block_stack[vm->block_sp++] = 
-                    (Block){.start_pc=then_start_pc, .end_pc=end_pc, .else_pc=else_pc, .type=4};
+                vm->block_stack[vm->block_sp++] = (Block){.start_pc=then_start_pc, .end_pc=end_pc, .else_pc=else_pc, .type=4};
                 
                 if (cond == 0) {
                     if (else_pc != 0) vm->pc = else_pc;
@@ -496,16 +544,28 @@ void run_function(WasmVM *vm) {
             }
 
             case OP_ELSE: {
+                // このオペコードは、if(cond==true) の場合に thenブロックの終端から実行される
+                printf("[else] (pc=%zu) ", current_pc);
                 if (vm->block_sp > 0) {
-                    Block current_if_block = vm->block_stack[vm->block_sp - 1];
-                    if (current_if_block.type == 4) {
-                        vm->pc = current_if_block.end_pc;
+                    Block current_block = vm->block_stack[vm->block_sp - 1];
+                    // thenブロックを実行したので、対応するendまでジャンプする
+                    if (current_block.type == 4) {
+                        printf("Jumping from 'else' block. Target end_pc is %zu; ", current_block.end_pc);
+                        vm->pc = current_block.end_pc;
+                        // --- DEBUG: pcが設定されたことを確認 ---
+                        printf("Next loop iteration will execute from pc=%zu.\n", vm->pc);
+                        // --- END DEBUG ---
+                    } else {
+                        printf("current_block.type=%d\n", current_block.type);
                     }
+                } else {
+                    printf("No block on stack for else. \n");
                 }
                 break;
             }
 
             case 0x0C: { // br
+                printf("[br]\n");
                 uint32_t depth = read_uLEB128(vm->code, &vm->pc);
                 if (depth >= vm->block_sp) { return; }
                 Block target = vm->block_stack[vm->block_sp - 1 - depth];
@@ -515,6 +575,7 @@ void run_function(WasmVM *vm) {
             }
 
             case 0x0D: { // br_if
+                printf("[br if]\n");
                 uint32_t depth = read_uLEB128(vm->code, &vm->pc);
                 if (vm->stack[--vm->sp] != 0) {
                     if (depth >= vm->block_sp) { return; }
@@ -547,7 +608,7 @@ void run_function(WasmVM *vm) {
                 uint32_t addr = (uint32_t)vm->stack[--vm->sp] + offset;
                 if (addr + 4 > sizeof(vm->memory)) { printf("Memory store out of range\n"); return; }
                 // --- DEBUG PRINT ---
-                printf("    [i32.store] addr=%u, val=%d (offset=%u)\n", addr, val, offset);
+                printf("[i32.store] addr=%u, val=%d (offset=%u) ", addr, val, offset);
                 // --- END DEBUG PRINT ---
                 vm->memory[addr]     = val & 0xFF;
                 vm->memory[addr + 1] = (val >> 8) & 0xFF;
@@ -560,130 +621,124 @@ void run_function(WasmVM *vm) {
                     (vm->memory[addr + 2] << 16) |
                     (vm->memory[addr + 3] << 24)
                 );
-                printf("      -> Verifying memory at addr=%u: read back value is %u\n", addr, written_val);
+                printf(" -> Verifying memory at addr=%u: read back value is %u\n", addr, written_val);
                 // --- END DEBUG PRINT ---
                 break;
             }
 
             case OP_DROP: { // drop
+                printf("[drop]\n");
                 vm->sp--;
                 break;
             }
             case 0x10: { // call
+                printf("[call] pc=%zu. block_sp=%d, call_sp=%d; ", current_pc, vm->block_sp, vm->call_sp);
                 uint32_t idx = read_uLEB128(vm->code, &vm->pc);
-            
+
                 if (idx < vm->import_func_count) {
+                    // --- インポート関数の呼び出し ---
                     ImportFunc *f = &vm->import_funcs[idx];
                     if (f->func == NULL) {
                         printf("Unresolved import function: %s.%s\n", f->mod_name, f->field_name);
                         return;
                     }
-                    if (f->type_index >= vm->func_type_count) {
-                        printf("Invalid type index for import function\n");
-                        return;
-                    }
                     FuncType *ftype = &vm->func_types[f->type_index];
                     int param_count = ftype->param_count;
 
-                    // int32_t args[16];
-                    // for (int i = param_count - 1; i >= 0; i--) {
-                    //     args[i] = vm->stack[--vm->sp];
-                    // }
-                    // // --- DEBUG PRINT ---
-                    // printf("    [call import] func_idx=%u, name='%s.%s'\n", idx, f->mod_name, f->field_name);
-                    // printf("      -> passing args from a local array, not from vm->stack\n");
-                    // // --- END DEBUG PRINT ---
-
-                    // int32_t ret = f->func(args, param_count);
-
-                    // VMのスタックポインタを引数の数だけ戻し、そのポインタを渡す
+                    printf("{call import} func_idx=%u, name='%s.%s', params=%d\n", idx, f->mod_name, f->field_name, param_count);
                     vm->sp -= param_count;
                     int32_t ret = f->func(&vm->stack[vm->sp], param_count);
 
-                    if (ftype->result_count > 0)
+                    if (ftype->result_count > 0) {
                         vm->stack[vm->sp++] = ret;
+                    }
                 } else {
+                    // --- 内部関数の呼び出し ---
+                    uint32_t type_idx = vm->func_type_indices[idx];
+                    FuncType *ftype = &vm->func_types[type_idx];
+                    int param_count = ftype->param_count;
+
+                    printf("{call internal} func_idx=%u, type_idx=%u, params=%d, vm->call_sp=%d; ", idx, type_idx, param_count, vm->call_sp);
+
                     // 関数呼び出しスタックに現在の状態を保存
                     if (vm->call_sp >= 64) { printf("Call stack overflow\n"); return; }
-                    vm->call_stack[vm->call_sp++] = (CallFrame){ .return_pc = vm->pc };
+                    // --- ADD: ローカル変数をCallFrameに保存 ---
+                    printf("Current locals[0] = %d; ", vm->locals[0]);
+                    memcpy(vm->call_stack[vm->call_sp].locals, vm->locals, sizeof(vm->locals));
+                    printf("Saved locals[0] = %d; ", vm->call_stack[vm->call_sp].locals[0]);
+                    // vm->call_stack[vm->call_sp++] = (CallFrame){ .return_pc = vm->pc };
+                    vm->call_stack[vm->call_sp++].return_pc = vm->pc;
+
                     // 新しい関数のPCにジャンプ
                     vm->pc = vm->func_pcs[idx];
-                    run_function(vm); // 再帰呼び出し
+
+                    // --- 関数のプロローグ (runの先頭にあった処理をここに移動) ---
+                    // スタックから引数をローカル変数にコピー
+                    for (int i = param_count - 1; i >= 0; i--) {
+                        vm->locals[i] = vm->stack[--vm->sp];
+                    }
+                    // デバッグ出力
+                    for (int i = 0; i < param_count; i++) {
+                        printf("arg[%d] = %d; ", i, vm->locals[i]);
+                    }
+                    printf("\n");
+                    // ローカル変数宣言をパース
+                    uint32_t local_groups = read_uLEB128(vm->code, &vm->pc);
+                    for (uint32_t i = 0; i < local_groups; i++) {
+                        (void)read_uLEB128(vm->code, &vm->pc); // num_locals
+                        (void)vm->code[vm->pc++]; // type
+                    }
+                    // --- 関数のプロローグここまで ---
                 }
                 break;
             }
+
             case OP_END: {
-                if (vm->block_sp > 0) { // ブロックの終端
-                    Block current_block = vm->block_stack[vm->block_sp - 1];
-                    if (current_block.end_pc == vm->pc) {
-                        vm->block_sp--;
+                printf("[end] pc=%zu. block_sp=%d, call_sp=%d\n", current_pc, vm->block_sp, vm->call_sp);
+            
+                // 現在のPCがブロックの終端を超えた場合も含めてポップ
+                while (vm->block_sp > 0 && vm->block_stack[vm->block_sp - 1].end_pc <= current_pc) {
+                    Block ended_block = vm->block_stack[--vm->block_sp];
+                    printf("  -> Block end. Popped block. New block_sp=%d. Block type=%d\n", vm->block_sp, ended_block.type);
+                }
+            
+                // ブロックスタックが空になったら関数の終端
+                if (vm->block_sp == 0) {
+                    printf("  -> Function end.\n");
+                    if (vm->call_sp > 0) {
+                        CallFrame frame = vm->call_stack[--vm->call_sp];
+                        memcpy(vm->locals, frame.locals, sizeof(vm->locals));
+                        vm->pc = frame.return_pc;
+                        printf("    [return from function] -> Set pc to %zu, call_sp=%d. Restored locals[0]=%d\n",
+                               vm->pc, vm->call_sp, vm->locals[0]);
+                    } else {
+                        printf("    [return from top level]. Final sp=%d\n", vm->sp);
+                        return;
                     }
-                } else { // トップレベルの終端
+                }
+                break;
+            }
+
+            case 0x0F: { // return
+                printf("return; (at pc=%zu) ", current_pc);
+                        printf("\n--- DEBUG: Returning from fib(1) ---\n");
+                        printf("    Return value on stack: %d, locals[0]: %d\n\n", vm->stack[vm->sp-1], vm->locals[0]);
+                if (vm->call_sp > 0) {
+                    CallFrame frame = vm->call_stack[--vm->call_sp];
+                    // --- ADD: ローカル変数をCallFrameから復元 ---
+                    memcpy(vm->locals, frame.locals, sizeof(vm->locals));
+                    vm->pc = frame.return_pc;
+                    printf("  [return from function] -> Set pc to %zu, call_sp=%d. Restored locals[0] = %d\n", vm->pc, vm->call_sp, vm->locals[0]);
+                } else {
                     return;
                 }
                 break;
             }
 
-            default:
-                printf("Unknown or unimplemented opcode: 0x%02X at pc=%zu\n", op, vm->pc - 1);
-                return;
-        }
-    }
-}
 
-// 単純な命令列を実行する（テスト用）
-// ローカル変数宣言のパースを行わない
-void run(WasmVM *vm) {
-    while (vm->pc < vm->size) {
-        uint8_t op = vm->code[vm->pc++];
-        switch (op) {
-            case 0x20: { uint32_t i = read_uLEB128(vm->code, &vm->pc); vm->stack[vm->sp++] = vm->locals[i]; break; }
-            case 0x21: { uint32_t i = read_uLEB128(vm->code, &vm->pc); vm->locals[i] = vm->stack[--vm->sp]; break; }
-            case 0x41: { int32_t val = read_sLEB128(vm->code, &vm->pc); vm->stack[vm->sp++] = val; break; }
-            case 0x6A: { int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = a + b; break; }
-            case 0x6B: { int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = a - b; break; }
-            case 0x6C: { int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = a * b; break; }
-            case 0x6D: { int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; if (b == 0) { return; } if (a == INT32_MIN && b == -1) { return; } vm->stack[vm->sp++] = a / b; break; }
-            case 0x6E: { uint32_t b = vm->stack[--vm->sp]; uint32_t a = vm->stack[--vm->sp]; if (b == 0) { return; } vm->stack[vm->sp++] = (int32_t)(a / b); break; }
-            case OP_I32_EQZ: { int32_t v = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (v == 0); break; }
-            case 0x48: { int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (a < b); break; }
-            case 0x49: { uint32_t b = vm->stack[--vm->sp]; uint32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (a < b); break; }
-            case 0x4A: { int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (a > b); break; }
-            case 0x4B: { uint32_t b = vm->stack[--vm->sp]; uint32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (a > b); break; }
-            case 0x4C: { int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (a <= b); break; }
-            case 0x4D: { uint32_t b = vm->stack[--vm->sp]; uint32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (a <= b); break; }
-            case 0x4E: { int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (a >= b); break; }
-            case 0x4F: { uint32_t b = vm->stack[--vm->sp]; uint32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (a >= b); break; }
-            case 0x02: { vm->pc++; size_t end = find_structured_end(vm->code, vm->size, vm->pc, NULL); vm->block_stack[vm->block_sp++] = (Block){.start_pc=vm->pc, .end_pc=end, .type=2}; break; }
-            case 0x03: { vm->pc++; size_t start = vm->pc; size_t end = find_structured_end(vm->code, vm->size, vm->pc, NULL); vm->block_stack[vm->block_sp++] = (Block){.start_pc=start, .end_pc=end, .type=3}; break; }
-            case OP_IF: { vm->pc++; size_t then_start_pc = vm->pc; size_t else_pc; size_t end_pc = find_structured_end(vm->code, vm->size, vm->pc, &else_pc); int32_t cond = vm->stack[--vm->sp]; vm->block_stack[vm->block_sp++] = (Block){.start_pc=then_start_pc, .end_pc=end_pc, .else_pc=else_pc, .type=4}; if (cond == 0) { if (else_pc != 0) vm->pc = else_pc; else vm->pc = end_pc; } break; }
-            case OP_ELSE: { if (vm->block_sp > 0) { Block b = vm->block_stack[vm->block_sp - 1]; if (b.type == 4) vm->pc = b.end_pc; } break; }
-            case 0x0C: { uint32_t d = read_uLEB128(vm->code, &vm->pc); if (d >= vm->block_sp) return; Block t = vm->block_stack[vm->block_sp - 1 - d]; if (t.type == 3) vm->pc = t.start_pc; else { vm->block_sp -= (d + 1); vm->pc = t.end_pc; } break; }
-            case 0x0D: { uint32_t d = read_uLEB128(vm->code, &vm->pc); if (vm->stack[--vm->sp] != 0) { if (d >= vm->block_sp) return; Block t = vm->block_stack[vm->block_sp - 1 - d]; if (t.type == 3) vm->pc = t.start_pc; else { vm->block_sp -= (d + 1); vm->pc = t.end_pc; } } break; }
-            case 0x28: { (void)read_uLEB128(vm->code, &vm->pc); uint32_t offset = read_uLEB128(vm->code, &vm->pc); uint32_t addr = (uint32_t)vm->stack[--vm->sp] + offset; if (addr + 4 > sizeof(vm->memory)) { return; } int32_t val = (int32_t)(vm->memory[addr] | (vm->memory[addr + 1] << 8) | (vm->memory[addr + 2] << 16) | (vm->memory[addr + 3] << 24)); vm->stack[vm->sp++] = val; break; }
-            case 0x36: { (void)read_uLEB128(vm->code, &vm->pc); uint32_t offset = read_uLEB128(vm->code, &vm->pc); int32_t val = vm->stack[--vm->sp]; uint32_t addr = (uint32_t)vm->stack[--vm->sp] + offset; if (addr + 4 > sizeof(vm->memory)) { return; } vm->memory[addr] = val & 0xFF; vm->memory[addr + 1] = (val >> 8) & 0xFF; vm->memory[addr + 2] = (val >> 16) & 0xFF; vm->memory[addr + 3] = (val >> 24) & 0xFF; break; }
-            case 0x10: { uint32_t idx = read_uLEB128(vm->code, &vm->pc); if (idx < vm->import_func_count) { ImportFunc *f = &vm->import_funcs[idx]; if (f->func == NULL) return; if (f->type_index >= vm->func_type_count) return; FuncType *ftype = &vm->func_types[f->type_index]; int param_count = ftype->param_count; int32_t args[16]; for (int i = param_count - 1; i >= 0; i--) args[i] = vm->stack[--vm->sp]; int32_t ret = f->func(args, param_count); if (ftype->result_count > 0) vm->stack[vm->sp++] = ret; } else { if (vm->call_sp >= 64) return; vm->call_stack[vm->call_sp++] = (CallFrame){ .return_pc = vm->pc }; vm->pc = vm->func_pcs[idx]; run_function(vm); } break; }
-            case OP_END: {
-                if (vm->block_sp > 0) { // ブロックの終端
-                    Block current_block = vm->block_stack[vm->block_sp - 1];
-                    if (current_block.end_pc == vm->pc) {
-                        vm->block_sp--;
-                    }
-                } else {
-                    // トップレベルのENDは関数の終わりを示す
-                    if (vm->call_sp > 0) {
-                        // 呼び出し元に復帰
-                        CallFrame frame = vm->call_stack[--vm->call_sp];
-                        vm->pc = frame.return_pc;
-                    } else {
-                        return; // 最上位の実行ループを終了
-                    }
-                }
-                break;
-            }
             default:
                 printf("Unknown or unimplemented opcode: 0x%02X at pc=%zu\n", op, vm->pc - 1);
-                return;
+                return; // ここで終了
         }
     }
 }
@@ -967,6 +1022,21 @@ int main() {
     // 1. モジュールをパース
     parse_sections(&vm);
 
+    // --- ADD: 実行開始前のプロローグ処理 ---
+    ExportFunc *f_main = find_export(&vm, "main_add");
+    if (f_main) {
+        printf("Executing exported function 'main_add'...\n");
+        vm.pc = vm.func_pcs[f_main->func_idx];
+
+        // 関数のプロローグ: ローカル変数宣言をパース
+        uint32_t local_groups = read_uLEB128(vm.code, &vm.pc);
+        for (uint32_t i = 0; i < local_groups; i++) {
+            (void)read_uLEB128(vm.code, &vm.pc); // num_locals
+            (void)vm.code[vm.pc++]; // type
+        }
+    }
+    // --- END ADD ---
+
     // 2. ホスト関数を登録
     vm_register_import(&vm, "env", "add", imported_add);
     vm_register_import(&vm, "env", "print_i32", print_i32);
@@ -974,9 +1044,8 @@ int main() {
     // 3. エクスポートされた関数を探して実行
     ExportFunc *f = find_export(&vm, "main_add");
     if (f) {
-        printf("Executing exported function 'main_add'...\n");
-        vm.pc = vm.func_pcs[f->func_idx];
-        run_function(&vm);
+        // 実行開始PCはプロローグ処理で設定済み
+        run(&vm);
         printf("Execution finished.\n");
     } else {
         printf("Export function 'main_add' not found.\n");
@@ -1000,6 +1069,21 @@ int main() {
         // 1. モジュールをパース
         parse_sections(&vm);
 
+        // --- ADD: 実行開始前のプロローグ処理 ---
+        ExportFunc *f_file_main = find_export(&vm, "main_add");
+        if (f_file_main) {
+            printf("Executing exported function 'main_add'...\n");
+            vm.pc = vm.func_pcs[f_file_main->func_idx];
+
+            // 関数のプロローグ: ローカル変数宣言をパース
+            uint32_t local_groups = read_uLEB128(vm.code, &vm.pc);
+            for (uint32_t i = 0; i < local_groups; i++) {
+                (void)read_uLEB128(vm.code, &vm.pc); // num_locals
+                (void)vm.code[vm.pc++]; // type
+            }
+        }
+        // --- END ADD ---
+
         // 2. ホスト関数を登録
         vm_register_import(&vm, "env", "add", imported_add);
         vm_register_import(&vm, "env", "print_i32", print_i32);
@@ -1007,9 +1091,8 @@ int main() {
         // 3. エクスポートされた関数を探して実行
         ExportFunc *f_file = find_export(&vm, "main_add");
         if (f_file) {
-            printf("Executing exported function 'main_add'...\n");
-            vm.pc = vm.func_pcs[f_file->func_idx];
-            run_function(&vm);
+            // 実行開始PCはプロローグ処理で設定済み
+            run(&vm);
             printf("Execution finished.\n");
         } else {
             printf("Export function 'main_add' not found.\n");
@@ -1036,15 +1119,29 @@ int main() {
         // 1. モジュールをパース
         parse_sections(&vm);
 
+        // --- ADD: 実行開始前のプロローグ処理 ---
+        ExportFunc *f_data_main = find_export(&vm, "read_and_print");
+        if (f_data_main) {
+            printf("Executing exported function 'read_and_print'...\n");
+            vm.pc = vm.func_pcs[f_data_main->func_idx];
+
+            // 関数のプロローグ: ローカル変数宣言をパース
+            uint32_t local_groups = read_uLEB128(vm.code, &vm.pc);
+            for (uint32_t i = 0; i < local_groups; i++) {
+                (void)read_uLEB128(vm.code, &vm.pc); // num_locals
+                (void)vm.code[vm.pc++]; // type
+            }
+        }
+        // --- END ADD ---
+
         // 2. ホスト関数を登録
         vm_register_import(&vm, "env", "print_i32", print_i32);
 
         // 3. エクスポートされた関数を探して実行
         ExportFunc *f_data = find_export(&vm, "read_and_print");
         if (f_data) {
-            printf("Executing exported function 'read_and_print'...\n");
-            vm.pc = vm.func_pcs[f_data->func_idx];
-            run_function(&vm);
+            // 実行開始PCはプロローグ処理で設定済み
+            run(&vm);
             printf("Execution finished.\n");
         } else {
             printf("Export function 'read_and_print' not found.\n");
@@ -1070,20 +1167,113 @@ int main() {
         // 1. モジュールをパース
         parse_sections(&vm);
 
+        // --- ADD: 実行開始前のプロローグ処理 ---
+        ExportFunc *f_wasi_main = find_export(&vm, "_start");
+        if (f_wasi_main) {
+            printf("Executing exported function '_start'...\n");
+            vm.pc = vm.func_pcs[f_wasi_main->func_idx];
+
+            // 関数のプロローグ: ローカル変数宣言をパース
+            uint32_t local_groups = read_uLEB128(vm.code, &vm.pc);
+            for (uint32_t i = 0; i < local_groups; i++) {
+                (void)read_uLEB128(vm.code, &vm.pc); // num_locals
+                (void)vm.code[vm.pc++]; // type
+            }
+        }
+        // --- END ADD ---
+
         // 2. ホスト関数を登録
         vm_register_import(&vm, "wasi_snapshot_preview1", "fd_write", wasi_fd_write);
 
         // 3. エクスポートされた関数を探して実行
         ExportFunc *f_wasi = find_export(&vm, "_start");
         if (f_wasi) {
-            printf("Executing exported function '_start'...\n");
-            vm.pc = vm.func_pcs[f_wasi->func_idx];
-            run_function(&vm);
+            // 実行開始PCはプロローグ処理で設定済み
+            run(&vm);
             printf("Execution finished.\n");
         } else {
             printf("Export function '_start' not found.\n");
         }
         free(wasm_wasi_code);
+    }
+    printf("--------------------\n");
+
+    // --- テストケース11: 再帰呼び出しによるフィボナッチ数の計算 ---
+    printf("--- Test Case 11: Recursive Fibonacci from file ---\n");
+    uint8_t wasm_fib_module[] = {
+        // Magic + Version
+        0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+        // Section 1: Type
+        0x01, 0x07, 0x01, // Section size 7, 1 type
+        // type 0: (i32) -> i32
+        0x60, 0x01, 0x7f, 0x01, 0x7f,
+        // Section 3: Function
+        0x03, 0x02, 0x01, 0x00, // Section size 2, 1 function, type_idx 0
+        // Section 7: Export
+        0x07, 0x07, 0x01, // Section size 7, 1 export
+        // export "fib" -> func_idx 0
+        0x03, 'f', 'i', 'b', 0x00, 0x00,
+        // Section 10: Code
+        0x0a, 0x1c, 0x01, // Section size 28, 1 function body
+        // func body 0 (fib):
+        0x1a, // body size 26
+        0x00, // 0 locals
+        // if (n <= 1) return n;
+        0x20, 0x00,       // local.get 0
+        0x41, 0x01,       // i32.const 1
+        0x4d,             // i32.le_u (or 4c for le_s)
+        0x04, 0x7f,       // if (result i32)
+        0x20, 0x00,       //   local.get 0
+        // else return fib(n-1) + fib(n-2);
+        0x05,             // else
+        0x20, 0x00,       //   local.get 0
+        0x41, 0x01,       //   i32.const 1
+        0x6b,             //   i32.sub
+        0x10, 0x00,       //   call 0 (fib)
+        0x20, 0x00,       //   local.get 0
+        0x41, 0x02,       //   i32.const 2
+        0x6b,             //   i32.sub
+        0x10, 0x00,       //   call 0 (fib)
+        0x6a,             //   i32.add
+        0x0b,             // end
+        0x0b              // end of function
+    };
+
+    memset(&vm, 0, sizeof(vm));
+    vm.code = wasm_fib_module;
+    vm.size = sizeof(wasm_fib_module);
+
+    // 1. モジュールをパース
+    parse_sections(&vm);
+
+    // --- ADD: 実行開始前のプロローグ処理 ---
+    ExportFunc *f_fib_main = find_export(&vm, "fib");
+    if (f_fib_main) {
+        printf("Executing exported function 'fib(10)'...\n");
+        vm.pc = vm.func_pcs[f_fib_main->func_idx];
+        vm.stack[vm.sp++] = 5; // 引数として 5 をスタックに積む
+
+        // 関数のプロローグ: 引数をローカル変数へ
+        FuncType *ftype = &vm.func_types[vm.func_type_indices[f_fib_main->func_idx]];
+        for (int i = ftype->param_count - 1; i >= 0; i--) {
+            vm.locals[i] = vm.stack[--vm.sp];
+        }
+        // 関数のプロローグ: ローカル変数宣言をパース
+        uint32_t local_groups = read_uLEB128(vm.code, &vm.pc);
+        for (uint32_t i = 0; i < local_groups; i++) {
+            (void)read_uLEB128(vm.code, &vm.pc); // num_locals
+            (void)vm.code[vm.pc++]; // type
+        }
+    }
+    // --- END ADD ---
+
+    // 2. エクスポートされた関数を探して実行
+    ExportFunc *f_fib = find_export(&vm, "fib");
+    if (f_fib) {
+        run(&vm);
+        printf("fib(5) = %d (expected 5)\n", vm.stack[vm.sp-1]);
+    } else {
+        printf("Export function 'fib' not found.\n");
     }
     printf("--------------------\n");
 
