@@ -547,6 +547,19 @@ void run(WasmVM *vm) {
                 vm->stack[vm->sp++] = count;          // スタックに結果を戻す
                 break;
             }
+            case 0x69: { // i32.popcnt
+                uint32_t value = (uint32_t)vm->stack[--vm->sp];
+                int32_t count = 0;
+            
+                // Brian Kernighan’s Algorithm（1 を消しながら数える）
+                while (value) {
+                    value &= (value - 1); // 最下位の 1 を消す
+                    count++;
+                }
+            
+                vm->stack[vm->sp++] = count;
+                break;
+            }
 
             case 0x6A: { // i32.add
                 int32_t b = vm->stack[--vm->sp];
@@ -917,7 +930,8 @@ int read_wasm_file(const char *filepath, uint8_t **buffer, size_t *size) {
     return 0;
 }
 
-int main() {
+// variable
+void test1() {
     // --- テストケース1: 基本的な演算とローカル変数 ---
     uint8_t code[] = {
         0x41, 0x05,       // i32.const 5      ; 定数 5 をスタックに積む
@@ -935,8 +949,12 @@ int main() {
     vm.pc = 0;
     run(&vm);
     printf("locals[2] = %d (expected 12)\n", vm.locals[2]);
-    printf("--------------------\n");
+}
 
+// numeric
+void test2() {
+
+    WasmVM vm;
     // --- テストケース2: 除算 ---
     uint8_t code1[] = {
         0x41, 0x0A,       // i32.const 10    ; 定数 10 をスタックに積む
@@ -950,7 +968,7 @@ int main() {
     printf("10 / 2 = %d (expected 5)\n", vm.stack[0]);
     printf("--------------------\n");
 
-    // --- テストケース2.1 ---
+    // --- テストケース2.1: ctz ---
     uint8_t code_ctz[] = {
         0x41, 0x80, 0x80, 0x80, 0x04, // i32.const 8388608
         0x68,                         // i32.ctz
@@ -962,7 +980,7 @@ int main() {
     printf("ctz 8388608 = %d (expected 23)\n", vm.stack[0]);
     printf("--------------------\n");
 
-    // --- テストケース2.2 ---
+    // --- テストケース2.2: clz ---
     uint8_t code_clz[] = {
         0x41, 0x80, 0x80, 0x80, 0x04, // i32.const 8388608
         0x67,                         // i32.clz
@@ -974,7 +992,7 @@ int main() {
     printf("clz 8388608 = %d (expected 8)\n", vm.stack[0]);
     printf("--------------------\n");
 
-    // --- テストケース3: 負数の除算 ---
+    // --- テストケース2.3: div_s ---
     uint8_t code2[] = {
         0x41, 0x7F,       // i32.const -1   ; 定数 -1 をスタックに積む（0x7F は 2の補数で -1）
         0x41, 0x01,       // i32.const 1    ; 定数 1 をスタックに積む
@@ -987,6 +1005,36 @@ int main() {
     printf("-1 / 1 = %d (expected -1)\n", vm.stack[0]);
     printf("--------------------\n");
 
+    // --- テストケース2.4: rem_u ---
+    uint8_t code_rem_u[] = {
+        0x41, 0x0A,       // i32.const 10
+        0x41, 0x03,       // i32.const 3
+        0x70,             // i32.rem_u
+        0x0B
+    };
+    memset(&vm, 0, sizeof(vm)); vm.code = code_rem_u; vm.size = sizeof(code_rem_u);
+    vm.pc = 0;
+    run(&vm);
+    printf("10 %% 3 = %d (expected 1)\n", vm.stack[0]);
+    printf("--------------------\n");
+
+    // --- テストケース2.4: popcnt ---
+    uint8_t code_popcnt[] = {
+        0x41, 0x82, 0x01,      // i32.const 130 (10000010)
+        0x69,                  // i32.popcnt
+        0x0B
+    };
+    memset(&vm, 0, sizeof(vm)); vm.code = code_popcnt; vm.size = sizeof(code_popcnt);
+    vm.pc = 0;
+    run(&vm);
+    printf("popcnt 130 = %d (expected 2)\n", vm.stack[0]);
+    printf("--------------------\n");
+
+}
+
+// control flow
+void test3() {
+    WasmVM vm;
     // --- テストケース4: ループ (0から4の合計を計算) ---
     uint8_t code_loop[] = {
         0x41, 0x00, 0x21, 0x00,       // i32.const 0; local.set 0  → i = 0
@@ -1039,7 +1087,11 @@ int main() {
     run(&vm);
     printf("if (1==0) result = %d (expected 222)\n", vm.stack[vm.sp-1]);
     printf("--------------------\n");
+}
 
+// memory
+void test4() {
+    WasmVM vm;
     // --- テストケース6: 線形メモリの read/write ---
     uint8_t code_mem[] = {
         0x41, 0x00,             // i32.const 0   -> addr = 0
@@ -1055,6 +1107,47 @@ int main() {
     run(&vm);
     printf("memory[0] loaded = %d (expected 120)\n", vm.stack[vm.sp-1]);
     printf("--------------------\n");
+}
+
+typedef struct {
+    const char *name;
+    void (*func)(void);
+} TestEntry;
+
+TestEntry tests[] = {
+    {"1", test1},
+    {"2", test2},
+    {"3", test3},
+    {"4", test4},
+    {NULL, NULL}
+};
+
+int main(int argc, char *argv[]) {
+
+    if (argc < 2) {
+        // printf("Usage: %s [test numbers]\n", argv[0]);
+        // return 1;
+    } else {
+        for (int i = 1; i < argc; i++) {
+            int found = 0;
+            for (int j = 0; tests[j].name != NULL; j++) {
+                if (strcmp(argv[i], tests[j].name) == 0) {
+                    tests[j].func();
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) {
+                printf("Unknown test: %s\n", argv[i]);
+            }
+        }
+    }
+    
+    if (argc >= 2) {
+        return 0;
+    }
+
+    WasmVM vm;
 
     // --- テストケース7: 型セクション、インポート/エクスポートを含むWasmモジュール ---
     printf("--- Test Case 7: Full module parsing and execution ---\n");
