@@ -8,9 +8,6 @@
 #define MAX_IMPORT_FUNCS 64
 #define MAX_EXPORT_FUNCS 64
 
-// Wasmの型定義
-#define TYPE_I32 0x7F
-
 typedef struct {
     uint8_t param_types[16];
     int param_count;
@@ -387,9 +384,6 @@ ExportFunc *find_export(WasmVM *vm, const char *name) {
     return NULL;
 }
 
-#include <stdint.h>
-#include <stddef.h>
-
 // 簡易的に WebAssembly の命令のオペランド長を判定してスキップする関数
 size_t skip_operands(uint8_t op, uint8_t *code, size_t pc) {
     switch (op) {
@@ -457,42 +451,151 @@ void run(WasmVM *vm) {
         uint8_t op = vm->code[vm->pc++]; // 命令を読み込み、pcをインクリメント
         printf("opcode: 0x%02X at pc=%zu; ", op, current_pc);
         switch (op) {
-            case 0x20: {
+            case 0x20: { // local.get
                 uint32_t i = read_uLEB128(vm->code, &vm->pc);
                 vm->stack[vm->sp++] = vm->locals[i];
                 printf("[local.get] %d: %d\n", i, vm->locals[i]);
                 break;
             }
-            case 0x21: { uint32_t i = read_uLEB128(vm->code, &vm->pc); vm->locals[i] = vm->stack[--vm->sp]; break; }
+            case 0x21: { // local.set
+                uint32_t i = read_uLEB128(vm->code, &vm->pc);
+                vm->locals[i] = vm->stack[--vm->sp];
+                break;
+            }
+            case 0x22: { // local.tee
+                uint32_t i = read_uLEB128(vm->code, &vm->pc);  // ローカルインデックスを取得
+                vm->locals[i] = vm->stack[vm->sp - 1];        // スタックトップの値をローカルにコピー
+                // vm->sp は減らさない → スタックに値を残す
+                break;
+            }
+
+            case 0x28: { // i32.load
+                (void)read_uLEB128(vm->code, &vm->pc); // align
+                uint32_t offset = read_uLEB128(vm->code, &vm->pc);
+                uint32_t addr = (uint32_t)vm->stack[--vm->sp] + offset;
+                if (addr + 4 > sizeof(vm->memory)) { printf("Memory load out of range\n"); return; }
+                int32_t val = (int32_t)(
+                    vm->memory[addr] |
+                    (vm->memory[addr + 1] << 8) |
+                    (vm->memory[addr + 2] << 16) |
+                    (vm->memory[addr + 3] << 24)
+                );
+                vm->stack[vm->sp++] = val;
+                break;
+            }
+
+            case 0x36: { // i32.store
+                (void)read_uLEB128(vm->code, &vm->pc); // align
+                uint32_t offset = read_uLEB128(vm->code, &vm->pc);
+                int32_t val = vm->stack[--vm->sp];
+                uint32_t addr = (uint32_t)vm->stack[--vm->sp] + offset;
+                if (addr + 4 > sizeof(vm->memory)) { printf("Memory store out of range\n"); return; }
+                printf("[i32.store] addr=%u, val=%d (offset=%u) ", addr, val, offset);
+                vm->memory[addr]     = val & 0xFF;
+                vm->memory[addr + 1] = (val >> 8) & 0xFF;
+                vm->memory[addr + 2] = (val >> 16) & 0xFF;
+                vm->memory[addr + 3] = (val >> 24) & 0xFF;
+                uint32_t written_val = (uint32_t)(
+                    vm->memory[addr] |
+                    (vm->memory[addr + 1] << 8) |
+                    (vm->memory[addr + 2] << 16) |
+                    (vm->memory[addr + 3] << 24)
+                );
+                printf(" -> Verifying memory at addr=%u: read back value is %u\n", addr, written_val);
+                break;
+            }
+
             case 0x41: { // i32.const
                 int32_t val = read_sLEB128(vm->code, &vm->pc);
                 printf("[i32.const] %d\n", val);
                 vm->stack[vm->sp++] = val;
                 break;
             }
+
+            case 0x67: { // i32.clz
+                int32_t value = vm->stack[--vm->sp];
+                if (value == 0) {
+                    vm->stack[vm->sp++] = 32;  // 全部0なら leading zeros = 32
+                    break;
+                }
+            
+                uint32_t uvalue = (uint32_t)value;
+                int32_t count = 0;
+            
+                // 上位ビットから順に0を数える
+                for (int i = 31; i >= 0; i--) {
+                    if (uvalue & (1u << i)) break; // 最初に1が見つかったら終了
+                    count++;
+                }
+            
+                vm->stack[vm->sp++] = count;
+                break;
+            }
+            case 0x68: { // i32.ctz
+                int32_t value = vm->stack[--vm->sp];  // スタックから値を取り出す
+                if (value == 0) {
+                    vm->stack[vm->sp++] = 32;       // 入力が0なら32ビット分すべてゼロ
+                    break;
+                }
+            
+                int32_t count = 0;
+                uint32_t uvalue = (uint32_t)value;   // 符号を無視してビット演算
+                while ((uvalue & 1) == 0) {           // 末尾のゼロを数える
+                    count++;
+                    uvalue >>= 1;
+                }
+                vm->stack[vm->sp++] = count;          // スタックに結果を戻す
+                break;
+            }
+
             case 0x6A: { // i32.add
                 int32_t b = vm->stack[--vm->sp];
                 int32_t a = vm->stack[--vm->sp];
                 vm->stack[vm->sp++] = a + b;
                 break;
             }
-            case 0x6B: {
+            case 0x6B: { // i32.sub
                 int32_t b = vm->stack[--vm->sp];
                 int32_t a = vm->stack[--vm->sp];
                 printf("[i32.sub] a = %d, b = %d\n", a, b);
                 vm->stack[vm->sp++] = a - b;
                 break;
             }
-            case 0x6C: { int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = a * b; break; } // i32.mul
-            case 0x6D: { int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; if (b == 0) { return; } if (a == INT32_MIN && b == -1) { return; } vm->stack[vm->sp++] = a / b; break; } // i32.div_s
-            case 0x6E: { uint32_t b = vm->stack[--vm->sp]; uint32_t a = vm->stack[--vm->sp]; if (b == 0) { return; } vm->stack[vm->sp++] = (int32_t)(a / b); break; } // i32.div_u
+            case 0x6C: { // i32.mul
+                int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = a * b; break;
+            }
+            case 0x6D: { // i32.div_s
+                int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; if (b == 0) { return; } if (a == INT32_MIN && b == -1) { return; }
+                vm->stack[vm->sp++] = a / b;
+                break;
+            }
+            case 0x6E: { // i32.div_u
+                uint32_t b = vm->stack[--vm->sp]; uint32_t a = vm->stack[--vm->sp]; if (b == 0) { return; }
+                vm->stack[vm->sp++] = (int32_t)(a / b);
+                break;
+            }
+            case 0x6F: { // i32.rem_s
+                int32_t b = vm->stack[--vm->sp];
+                int32_t a = vm->stack[--vm->sp];
+                if (b == 0) { return; }
+                vm->stack[vm->sp++] = a % b;
+                break;
+            }
+            case 0x70: { // i32.rem_u
+                uint32_t b = (uint32_t)vm->stack[--vm->sp];
+                uint32_t a = (uint32_t)vm->stack[--vm->sp];
+                if (b == 0) { return; }
+                vm->stack[vm->sp++] = a % b;
+                break;
+            }
+
             case 0x45: { int32_t v = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (v == 0); break; }
             case 0x48: { int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (a < b); break; }
             case 0x49: { uint32_t b = vm->stack[--vm->sp]; uint32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (a < b); break; }
             case 0x4A: { int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (a > b); break; }
             case 0x4B: { uint32_t b = vm->stack[--vm->sp]; uint32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (a > b); break; }
             case 0x4C: { int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (a <= b); break; }
-            case 0x4D: {
+            case 0x4D: { // le_u
                 uint32_t b = vm->stack[--vm->sp];
                 uint32_t a = vm->stack[--vm->sp];
                 printf("[i32.le_u] a = %d, b = %d\n", a, b);
@@ -502,6 +605,10 @@ void run(WasmVM *vm) {
             case 0x4E: { int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (a >= b); break; }
             case 0x4F: { uint32_t b = vm->stack[--vm->sp]; uint32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (a >= b); break; }
 
+            case 0x01: { // nop
+                printf("[nop]\n");
+                break;
+            }
             case 0x02: { // block
                 vm->pc++;
                 size_t end = find_structured_end(vm->code, vm->size, vm->pc, NULL);
@@ -553,6 +660,32 @@ void run(WasmVM *vm) {
                 break;
             }
 
+            case 0x0B: { // end
+                printf("[end] pc=%zu. block_sp=%d, call_sp=%d\n", current_pc, vm->block_sp, vm->call_sp);
+            
+                // 現在のPCがブロックの終端を超えた場合も含めてポップ
+                while (vm->block_sp > 0 && vm->block_stack[vm->block_sp - 1].end_pc <= current_pc) {
+                    Block ended_block = vm->block_stack[--vm->block_sp];
+                    printf("  -> Block end. Popped block. New block_sp=%d. Block type=%d\n", vm->block_sp, ended_block.type);
+                }
+            
+                // ブロックスタックが空になったら関数の終端
+                if (vm->block_sp == 0) {
+                    printf("  -> Function end.\n");
+                    if (vm->call_sp > 0) {
+                        CallFrame frame = vm->call_stack[--vm->call_sp];
+                        memcpy(vm->locals, frame.locals, sizeof(vm->locals));
+                        vm->pc = frame.return_pc;
+                        printf("    [return from function] -> Set pc to %zu, call_sp=%d. Restored locals[0]=%d\n",
+                               vm->pc, vm->call_sp, vm->locals[0]);
+                    } else {
+                        printf("    [return from top level]. Final sp=%d\n", vm->sp);
+                        return;
+                    }
+                }
+                break;
+            }
+
             case 0x0C: { // br
                 printf("[br]\n");
                 uint32_t depth = read_uLEB128(vm->code, &vm->pc);
@@ -575,47 +708,22 @@ void run(WasmVM *vm) {
                 break;
             }
 
-            case 0x28: { // i32.load
-                (void)read_uLEB128(vm->code, &vm->pc); // align
-                uint32_t offset = read_uLEB128(vm->code, &vm->pc);
-                uint32_t addr = (uint32_t)vm->stack[--vm->sp] + offset;
-                if (addr + 4 > sizeof(vm->memory)) { printf("Memory load out of range\n"); return; }
-                int32_t val = (int32_t)(
-                    vm->memory[addr] |
-                    (vm->memory[addr + 1] << 8) |
-                    (vm->memory[addr + 2] << 16) |
-                    (vm->memory[addr + 3] << 24)
-                );
-                vm->stack[vm->sp++] = val;
+            case 0x0F: { // return
+                printf("return; (at pc=%zu) ", current_pc);
+                        printf("\n--- DEBUG: Returning from fib(1) ---\n");
+                        printf("    Return value on stack: %d, locals[0]: %d\n\n", vm->stack[vm->sp-1], vm->locals[0]);
+                if (vm->call_sp > 0) {
+                    CallFrame frame = vm->call_stack[--vm->call_sp];
+                    // --- ADD: ローカル変数をCallFrameから復元 ---
+                    memcpy(vm->locals, frame.locals, sizeof(vm->locals));
+                    vm->pc = frame.return_pc;
+                    printf("  [return from function] -> Set pc to %zu, call_sp=%d. Restored locals[0] = %d\n", vm->pc, vm->call_sp, vm->locals[0]);
+                } else {
+                    return;
+                }
                 break;
             }
 
-            case 0x36: { // i32.store
-                (void)read_uLEB128(vm->code, &vm->pc); // align
-                uint32_t offset = read_uLEB128(vm->code, &vm->pc);
-                int32_t val = vm->stack[--vm->sp];
-                uint32_t addr = (uint32_t)vm->stack[--vm->sp] + offset;
-                if (addr + 4 > sizeof(vm->memory)) { printf("Memory store out of range\n"); return; }
-                printf("[i32.store] addr=%u, val=%d (offset=%u) ", addr, val, offset);
-                vm->memory[addr]     = val & 0xFF;
-                vm->memory[addr + 1] = (val >> 8) & 0xFF;
-                vm->memory[addr + 2] = (val >> 16) & 0xFF;
-                vm->memory[addr + 3] = (val >> 24) & 0xFF;
-                uint32_t written_val = (uint32_t)(
-                    vm->memory[addr] |
-                    (vm->memory[addr + 1] << 8) |
-                    (vm->memory[addr + 2] << 16) |
-                    (vm->memory[addr + 3] << 24)
-                );
-                printf(" -> Verifying memory at addr=%u: read back value is %u\n", addr, written_val);
-                break;
-            }
-
-            case 0x1A: { // drop
-                printf("[drop]\n");
-                vm->sp--;
-                break;
-            }
             case 0x10: { // call
                 printf("[call] pc=%zu. block_sp=%d, call_sp=%d; ", current_pc, vm->block_sp, vm->call_sp);
                 uint32_t idx = read_uLEB128(vm->code, &vm->pc);
@@ -678,48 +786,11 @@ void run(WasmVM *vm) {
                 break;
             }
 
-            case 0x0B: {
-                printf("[end] pc=%zu. block_sp=%d, call_sp=%d\n", current_pc, vm->block_sp, vm->call_sp);
-            
-                // 現在のPCがブロックの終端を超えた場合も含めてポップ
-                while (vm->block_sp > 0 && vm->block_stack[vm->block_sp - 1].end_pc <= current_pc) {
-                    Block ended_block = vm->block_stack[--vm->block_sp];
-                    printf("  -> Block end. Popped block. New block_sp=%d. Block type=%d\n", vm->block_sp, ended_block.type);
-                }
-            
-                // ブロックスタックが空になったら関数の終端
-                if (vm->block_sp == 0) {
-                    printf("  -> Function end.\n");
-                    if (vm->call_sp > 0) {
-                        CallFrame frame = vm->call_stack[--vm->call_sp];
-                        memcpy(vm->locals, frame.locals, sizeof(vm->locals));
-                        vm->pc = frame.return_pc;
-                        printf("    [return from function] -> Set pc to %zu, call_sp=%d. Restored locals[0]=%d\n",
-                               vm->pc, vm->call_sp, vm->locals[0]);
-                    } else {
-                        printf("    [return from top level]. Final sp=%d\n", vm->sp);
-                        return;
-                    }
-                }
+            case 0x1A: { // drop
+                printf("[drop]\n");
+                vm->sp--;
                 break;
             }
-
-            case 0x0F: { // return
-                printf("return; (at pc=%zu) ", current_pc);
-                        printf("\n--- DEBUG: Returning from fib(1) ---\n");
-                        printf("    Return value on stack: %d, locals[0]: %d\n\n", vm->stack[vm->sp-1], vm->locals[0]);
-                if (vm->call_sp > 0) {
-                    CallFrame frame = vm->call_stack[--vm->call_sp];
-                    // --- ADD: ローカル変数をCallFrameから復元 ---
-                    memcpy(vm->locals, frame.locals, sizeof(vm->locals));
-                    vm->pc = frame.return_pc;
-                    printf("  [return from function] -> Set pc to %zu, call_sp=%d. Restored locals[0] = %d\n", vm->pc, vm->call_sp, vm->locals[0]);
-                } else {
-                    return;
-                }
-                break;
-            }
-
 
             default:
                 printf("Unknown or unimplemented opcode: 0x%02X at pc=%zu\n", op, vm->pc - 1);
@@ -781,6 +852,7 @@ int32_t wasi_fd_write(int32_t *args, int argc) {
     *(uint32_t*)&vm->memory[nwritten_ptr] = bytes_written;
     return 0; // __WASI_ERRNO_SUCCESS
 }
+
 // Wasmバイナリを16進数でダンプする関数
 void dump_wasm_code(const uint8_t *code, size_t size) {
     printf("--- Wasm Code Dump (size: %zu bytes) ---\n", size);
@@ -856,7 +928,7 @@ int main() {
         0x20, 0x01,       // local.get 1      ; ローカル変数1の値をスタックに積む
         0x6A,             // i32.add          ; スタックの2つの値を加算
         0x21, 0x02,       // local.set 2      ; 結果をローカル変数2に格納
-        0x0B
+        0x0B              // end
     };
     WasmVM vm;
     memset(&vm, 0, sizeof(vm)); vm.code = code; vm.size = sizeof(code);
@@ -870,12 +942,36 @@ int main() {
         0x41, 0x0A,       // i32.const 10    ; 定数 10 をスタックに積む
         0x41, 0x02,       // i32.const 2     ; 定数 2 をスタックに積む
         0x6D,             // i32.div_s       ; スタックの2つの値を符号付き整数で割る (10 / 2)
-        0x0B
+        0x0B              // end
     };
     memset(&vm, 0, sizeof(vm)); vm.code = code1; vm.size = sizeof(code1);
     vm.pc = 0;
     run(&vm);
     printf("10 / 2 = %d (expected 5)\n", vm.stack[0]);
+    printf("--------------------\n");
+
+    // --- テストケース2.1 ---
+    uint8_t code_ctz[] = {
+        0x41, 0x80, 0x80, 0x80, 0x04, // i32.const 8388608
+        0x68,                         // i32.ctz
+        0x0B                          // end
+    };
+    memset(&vm, 0, sizeof(vm)); vm.code = code_ctz; vm.size = sizeof(code_ctz);
+    vm.pc = 0;
+    run(&vm);
+    printf("ctz 8388608 = %d (expected 23)\n", vm.stack[0]);
+    printf("--------------------\n");
+
+    // --- テストケース2.2 ---
+    uint8_t code_clz[] = {
+        0x41, 0x80, 0x80, 0x80, 0x04, // i32.const 8388608
+        0x67,                         // i32.clz
+        0x0B                          // end
+    };
+    memset(&vm, 0, sizeof(vm)); vm.code = code_clz; vm.size = sizeof(code_clz);
+    vm.pc = 0;
+    run(&vm);
+    printf("clz 8388608 = %d (expected 8)\n", vm.stack[0]);
     printf("--------------------\n");
 
     // --- テストケース3: 負数の除算 ---
