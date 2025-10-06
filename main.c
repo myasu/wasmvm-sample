@@ -5,15 +5,6 @@
 #include <string.h>
 #include <stdlib.h>
 
-// オペコード定義
-#define OP_IF        0x04
-#define OP_ELSE      0x05
-#define OP_END       0x0B
-#define OP_I32_CONST 0x41
-#define OP_LOCAL_GET 0x20
-#define OP_I32_EQZ   0x45
-#define OP_DROP      0x1A
-
 #define MAX_IMPORT_FUNCS 64
 #define MAX_EXPORT_FUNCS 64
 
@@ -495,7 +486,7 @@ void run(WasmVM *vm) {
             case 0x6C: { int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = a * b; break; } // i32.mul
             case 0x6D: { int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; if (b == 0) { return; } if (a == INT32_MIN && b == -1) { return; } vm->stack[vm->sp++] = a / b; break; } // i32.div_s
             case 0x6E: { uint32_t b = vm->stack[--vm->sp]; uint32_t a = vm->stack[--vm->sp]; if (b == 0) { return; } vm->stack[vm->sp++] = (int32_t)(a / b); break; } // i32.div_u
-            case OP_I32_EQZ: { int32_t v = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (v == 0); break; }
+            case 0x45: { int32_t v = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (v == 0); break; }
             case 0x48: { int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (a < b); break; }
             case 0x49: { uint32_t b = vm->stack[--vm->sp]; uint32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (a < b); break; }
             case 0x4A: { int32_t b = vm->stack[--vm->sp]; int32_t a = vm->stack[--vm->sp]; vm->stack[vm->sp++] = (a > b); break; }
@@ -525,7 +516,7 @@ void run(WasmVM *vm) {
                 break;
             }
 
-            case OP_IF: {
+            case 0x04: { // if
                 vm->pc++; // blocktype をスキップ
                 size_t then_start_pc = vm->pc;
                 size_t else_pc;
@@ -543,8 +534,8 @@ void run(WasmVM *vm) {
                 break;
             }
 
-            case OP_ELSE: {
-                // このオペコードは、if(cond==true) の場合に thenブロックの終端から実行される
+            case 0x05: { // else
+                // if(cond==true) の場合に thenブロックの終端から実行される
                 printf("[else] (pc=%zu) ", current_pc);
                 if (vm->block_sp > 0) {
                     Block current_block = vm->block_stack[vm->block_sp - 1];
@@ -552,9 +543,7 @@ void run(WasmVM *vm) {
                     if (current_block.type == 4) {
                         printf("Jumping from 'else' block. Target end_pc is %zu; ", current_block.end_pc);
                         vm->pc = current_block.end_pc;
-                        // --- DEBUG: pcが設定されたことを確認 ---
                         printf("Next loop iteration will execute from pc=%zu.\n", vm->pc);
-                        // --- END DEBUG ---
                     } else {
                         printf("current_block.type=%d\n", current_block.type);
                     }
@@ -607,14 +596,11 @@ void run(WasmVM *vm) {
                 int32_t val = vm->stack[--vm->sp];
                 uint32_t addr = (uint32_t)vm->stack[--vm->sp] + offset;
                 if (addr + 4 > sizeof(vm->memory)) { printf("Memory store out of range\n"); return; }
-                // --- DEBUG PRINT ---
                 printf("[i32.store] addr=%u, val=%d (offset=%u) ", addr, val, offset);
-                // --- END DEBUG PRINT ---
                 vm->memory[addr]     = val & 0xFF;
                 vm->memory[addr + 1] = (val >> 8) & 0xFF;
                 vm->memory[addr + 2] = (val >> 16) & 0xFF;
                 vm->memory[addr + 3] = (val >> 24) & 0xFF;
-                // --- DEBUG PRINT ---
                 uint32_t written_val = (uint32_t)(
                     vm->memory[addr] |
                     (vm->memory[addr + 1] << 8) |
@@ -622,11 +608,10 @@ void run(WasmVM *vm) {
                     (vm->memory[addr + 3] << 24)
                 );
                 printf(" -> Verifying memory at addr=%u: read back value is %u\n", addr, written_val);
-                // --- END DEBUG PRINT ---
                 break;
             }
 
-            case OP_DROP: { // drop
+            case 0x1A: { // drop
                 printf("[drop]\n");
                 vm->sp--;
                 break;
@@ -693,7 +678,7 @@ void run(WasmVM *vm) {
                 break;
             }
 
-            case OP_END: {
+            case 0x0B: {
                 printf("[end] pc=%zu. block_sp=%d, call_sp=%d\n", current_pc, vm->block_sp, vm->call_sp);
             
                 // 現在のPCがブロックの終端を超えた場合も含めてポップ
@@ -863,15 +848,15 @@ int read_wasm_file(const char *filepath, uint8_t **buffer, size_t *size) {
 int main() {
     // --- テストケース1: 基本的な演算とローカル変数 ---
     uint8_t code[] = {
-        0x41, 0x05,       // i32.const 5       ; 定数 5 をスタックに積む
+        0x41, 0x05,       // i32.const 5      ; 定数 5 をスタックに積む
         0x21, 0x00,       // local.set 0      ; スタックの値をローカル変数0に格納
-        0x41, 0x07,       // i32.const 7       ; 定数 7 をスタックに積む
+        0x41, 0x07,       // i32.const 7      ; 定数 7 をスタックに積む
         0x21, 0x01,       // local.set 1      ; スタックの値をローカル変数1に格納
         0x20, 0x00,       // local.get 0      ; ローカル変数0の値をスタックに積む
         0x20, 0x01,       // local.get 1      ; ローカル変数1の値をスタックに積む
         0x6A,             // i32.add          ; スタックの2つの値を加算
         0x21, 0x02,       // local.set 2      ; 結果をローカル変数2に格納
-        OP_END
+        0x0B
     };
     WasmVM vm;
     memset(&vm, 0, sizeof(vm)); vm.code = code; vm.size = sizeof(code);
@@ -885,7 +870,7 @@ int main() {
         0x41, 0x0A,       // i32.const 10    ; 定数 10 をスタックに積む
         0x41, 0x02,       // i32.const 2     ; 定数 2 をスタックに積む
         0x6D,             // i32.div_s       ; スタックの2つの値を符号付き整数で割る (10 / 2)
-        OP_END
+        0x0B
     };
     memset(&vm, 0, sizeof(vm)); vm.code = code1; vm.size = sizeof(code1);
     vm.pc = 0;
@@ -898,7 +883,7 @@ int main() {
         0x41, 0x7F,       // i32.const -1   ; 定数 -1 をスタックに積む（0x7F は 2の補数で -1）
         0x41, 0x01,       // i32.const 1    ; 定数 1 をスタックに積む
         0x6D,             // i32.div_s      ; スタックの2つの値を符号付き整数で割る (-1 / 1)
-        OP_END
+        0x0B
     };
     memset(&vm, 0, sizeof(vm)); vm.code = code2; vm.size = sizeof(code2);
     vm.pc = 0;
@@ -925,8 +910,8 @@ int main() {
                 0x6A,                  // i32.add      → i + 1
                 0x21, 0x00,            // local.set 0  → i に保存
                 0x0C, 0x00,            // br 0         → loop の先頭に戻る
-            OP_END,
-        OP_END                         // end (外側ブロック終了)
+            0x0B,
+        0x0B                         // end (外側ブロック終了)
     };
     memset(&vm, 0, sizeof(vm)); vm.code = code_loop; vm.size = sizeof(code_loop);
     vm.pc = 0;
@@ -937,13 +922,13 @@ int main() {
 
     // --- テストケース5: if/else ---
     uint8_t code_if[] = {
-        OP_LOCAL_GET, 0x00,
-        OP_I32_EQZ,
-        OP_IF, 0x40,
-            OP_I32_CONST, 0xef, 0x00, // 111
-        OP_ELSE,
-            OP_I32_CONST, 0xde, 0x01, // 222
-        OP_END
+        0x20, 0x00,                 // local.get
+        0x45,                       // i32.eqz
+        0x04, 0x40,                 // if (void)
+        0x41, 0xef, 0x00,           // i32.const 111
+        0x05,                       // else
+        0x41, 0xde, 0x01,           // i32.const 222
+        0x0B
     };
     
     // param = 0 のとき (cond=true)
@@ -967,7 +952,7 @@ int main() {
     
         0x41, 0x00,             // i32.const 0   -> addr = 0
         0x28, 0x02, 0x00,       // i32.load  align=2 offset=0
-        OP_END
+        0x0B
     };
     memset(&vm, 0, sizeof(vm)); vm.code = code_mem; vm.size = sizeof(code_mem);
     vm.pc = 0;
@@ -1009,7 +994,7 @@ int main() {
         0x41, 0x05,       // i32.const 5
         0x6a,             // i32.add
         0x10, 0x01,       // call 1 (imported "print_i32")
-        OP_END
+        0x0B
     };
 
     memset(&vm, 0, sizeof(vm));
@@ -1249,7 +1234,7 @@ int main() {
     // --- ADD: 実行開始前のプロローグ処理 ---
     ExportFunc *f_fib_main = find_export(&vm, "fib");
     if (f_fib_main) {
-        printf("Executing exported function 'fib(10)'...\n");
+        printf("Executing exported function 'fib(5)'...\n");
         vm.pc = vm.func_pcs[f_fib_main->func_idx];
         vm.stack[vm.sp++] = 5; // 引数として 5 をスタックに積む
 
